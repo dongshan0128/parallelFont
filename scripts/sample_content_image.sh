@@ -1,0 +1,12 @@
+python sample.py \
+    --ckpt_dir="outputs/FontDiffuser_431Fonts/phase_2/global_step_25000" \
+    --content_image_path="data_examples/sampling/example_content.jpg" \
+    --style_image_path="data_examples/sampling/example_style.jpg" \
+    --save_image \
+    --save_image_dir="outputs/FontDiffuser_431Fonts" \
+    --device="cuda:0" \
+    --algorithm_type="dpmsolver++" \
+    --guidance_type="classifier-free" \
+    --guidance_scale=6.5 \
+    --num_inference_steps=30 \
+    --method="multistep"
