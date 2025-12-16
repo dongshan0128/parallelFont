@@ -4,6 +4,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from .CBAM import CBAM
+from .EnergyCrossAttention import EnergyCrossAttention
 
 
 class SpatialTransformer(nn.Module):
@@ -96,9 +97,12 @@ class BasicTransformerBlock(nn.Module):
             query_dim=dim, heads=n_heads, dim_head=d_head, dropout=dropout
         )  # is a self-attention
         self.ff = FeedForward(dim, dropout=dropout, glu=gated_ff)
-        self.attn2 = CrossAttention(
-            query_dim=dim, context_dim=context_dim, heads=n_heads, dim_head=d_head, dropout=dropout
-        )  # is self-attn if context is none
+        # self.attn2 = CrossAttention(
+        #     query_dim=dim, context_dim=context_dim, heads=n_heads, dim_head=d_head, dropout=dropout
+        # )  # is self-attn if context is none
+        self.attn2 = EnergyCrossAttention(
+            query_dim=dim, cross_attention_dim=context_dim, heads=n_heads, dim_head=d_head, dropout=dropout
+        )
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
         self.norm3 = nn.LayerNorm(dim)
@@ -288,8 +292,15 @@ class OffsetRefStrucInter(nn.Module):
 
         # cross-attention
         # dim_head is the middle dealing dimension, output dimension will be change to quert_dim by Linear
-        self.cross_attention = CrossAttention(
-            query_dim=style_feat_in_channels, context_dim=res_in_channels, heads=n_heads, dim_head=res_in_channels, dropout=dropout
+        # self.cross_attention = CrossAttention(
+        #     query_dim=style_feat_in_channels, context_dim=res_in_channels, heads=n_heads, dim_head=res_in_channels, dropout=dropout
+        # )
+        self.cross_attention = EnergyCrossAttention(
+            query_dim=style_feat_in_channels,
+            cross_attention_dim=res_in_channels,
+            heads=n_heads,
+            dim_head=res_in_channels,
+            dropout=dropout,
         )
 
         # FFN

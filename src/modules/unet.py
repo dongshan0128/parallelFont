@@ -89,6 +89,7 @@ class UNet(ModelMixin, ConfigMixin):
                 mac_block_counter += 1
                 # 只有MAC块需要content_channel
                 content_channel = content_start_channel*(2**(mac_block_counter-1))
+                
             else :
                 content_channel = 0
                 
@@ -276,7 +277,7 @@ class UNet(ModelMixin, ConfigMixin):
         for index,downsample_block in enumerate(self.down_blocks):
 
             if hasattr(downsample_block, "content_attentions"):
-                # MCADownBlock
+                # 指MCADownBlock层
                 efficient_index += 1
                 sample, res_samples = downsample_block(
                     hidden_states=sample,

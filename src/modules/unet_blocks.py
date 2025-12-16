@@ -110,7 +110,7 @@ def get_down_block_with_parallel(
             reduction=reduction)
     elif down_block_type == "ParallelDownBlock2D":
         return ParallelDownBlock2D(
-            num_layers=num_layers,
+            num_layers=1,
             in_channels=in_channels,
             out_channels=out_channels,
             temb_channels=temb_channels,
@@ -214,7 +214,7 @@ def get_up_block_with_parallel(
             upblock_index=upblock_index)
     elif up_block_type == "ParallelUpBlock2D":
         return ParallelUpBlock2D(
-            num_layers=num_layers-1,
+            num_layers=1,
             in_channels=in_channels,
             out_channels=out_channels,
             prev_output_channel=prev_output_channel,
