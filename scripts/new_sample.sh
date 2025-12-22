@@ -1,7 +1,11 @@
-python sample.py \
+python new_sample.py \
     --ckpt_dir="outputs/FontDiffuser_431Fonts/phase_2/global_step_30000" \
-    --content_image_path="data_examples/sampling/1166.png" \
-    --style_image_path="data_examples/train/TargetImage/FZBGDT/博.jpg" \
+    --test_type="SFUC_step30" \
+    --content_image_path="data_examples/test/SFUC/unseen-240Img" \
+    --content_character="data_examples/test/SFUC/unseen_240.json" \
+    --style_image_path="" \
+    --style_ttf_path="data_examples/test/SFUC/style" \
+    --style_content="笼" \
     --save_image \
     --save_image_dir="outputs_Image/parallel+CBAM+ECA" \
     --device="cuda:0" \

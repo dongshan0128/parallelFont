@@ -23,7 +23,10 @@ def save_single_image(save_dir, image):
 
     save_path = f"{save_dir}/out_single.png"
     image.save(save_path)
+    
+def save_result_image(save_dir, image):
 
+    image.save(save_dir)
 
 def save_image_with_content_style(save_dir, image, content_image_pil, content_image_path, style_image_path, resolution):
     

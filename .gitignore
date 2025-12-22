@@ -202,6 +202,7 @@ wandb
 # 屏蔽字体文件（如果字体很大或很多）
 *.ttf
 *.otf
+*.TTF
 
 # 如果你发现了刚才那30万个文件所在的文件夹（比如叫 my_dataset），把它也加进来
 data_examples/train/
