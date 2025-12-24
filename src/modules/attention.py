@@ -312,7 +312,8 @@ class OffsetRefStrucInter(nn.Module):
 
     def forward(self, res_hidden_states, style_content_hidden_states):
         batch, c_channel, height, width = res_hidden_states.shape
-        _, s_channel, _, _ = style_content_hidden_states.shape
+        batch_s, s_channel, height_s, width_s = style_content_hidden_states.shape
+        
         # style projecter
         style_content_hidden_states = self.gnorm_s(style_content_hidden_states)
         style_content_hidden_states = self.style_proj_in(style_content_hidden_states)
@@ -408,6 +409,15 @@ class ChannelAttnBlock(nn.Module):
         self.down_channel = nn.Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=1) # conv1*1
 
     def forward(self, input, content_feature):
+        # ✅ 添加尺寸检查和自动插值
+        if content_feature. shape[2:] != input. shape[2:]:
+            import torch.nn.functional as F
+            content_feature = F.interpolate(
+                content_feature,
+                size=input.shape[2:],
+                mode='bilinear',
+                align_corners=False
+            )
 
         concat_feature = torch.cat([input, content_feature], dim=1)
         hidden_states = concat_feature
@@ -447,7 +457,7 @@ class SelfAttentionBlock(nn.Module):
         super().__init__()
         
         self.in_channels = in_channels
-        self.n_heads = n_heads
+        self.n_heads = n_heads//2  # 平行处理时，头数减半
         self. d_head = d_head
         self.inner_dim = n_heads * d_head
         
@@ -513,3 +523,126 @@ class SelfAttentionBlock(nn.Module):
         
         # 8. 残差连接
         return hidden_states + residual
+    
+
+class WindowAttentionBlock(nn.Module):
+    """窗口注意力 - 保护细小笔画"""
+    def __init__(self, channels, window_size=4, num_heads=4, num_groups=32):
+        super().__init__()
+        self.ws = window_size
+        self. num_heads = num_heads
+        self.scale = (channels // num_heads) ** -0.5
+        
+        self.norm = nn.GroupNorm(num_groups, channels)
+        self.qkv = nn.Linear(channels, channels * 3)
+        self.proj = nn. Linear(channels, channels)
+    
+    def forward(self, x):
+        B, C, H, W = x.shape
+        ws = self.ws
+
+        # ✅ 检查尺寸能否整除
+        if H % ws != 0 or W % ws != 0:
+            # 填充
+            pad_h = (ws - H % ws) % ws
+            pad_w = (ws - W % ws) % ws
+            x = F.pad(x, (0, pad_w, 0, pad_h))
+            H_pad, W_pad = H + pad_h, W + pad_w
+        else:
+            H_pad, W_pad = H, W
+            pad_h, pad_w = 0, 0
+
+        # 归一化
+        x_norm = self.norm(x)
+        
+        # 分割窗口:  [B, C, H, W] → [B*num_windows, ws*ws, C]
+        x_windows = self. partition_windows(x_norm, ws)
+        
+        # QKV
+        qkv = self.qkv(x_windows)  # [B*nW, ws*ws, 3*C]
+        qkv = qkv.reshape(-1, ws*ws, 3, self.num_heads, C // self.num_heads)
+        qkv = qkv.permute(2, 0, 3, 1, 4)  # [3, B*nW, heads, ws*ws, C//heads]
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        
+        # 窗口内注意力
+        attn = (q @ k.transpose(-2, -1)) * self.scale  # [B*nW, heads, ws*ws, ws*ws]
+        attn = attn.softmax(dim=-1)
+        
+        # 应用注意力
+        out = (attn @ v).transpose(1, 2).reshape(-1, ws*ws, C)
+        out = self.proj(out)
+        
+        # 恢复形状
+        out = self.reverse_windows(out, ws, H, W, B)
+
+        # 裁剪填充
+        if pad_h > 0 or pad_w > 0:
+            out = out[:, :, : H, :W]
+            x = x[:, :, :H, :W]
+        
+        return out + x  # 残差连接
+    
+    def partition_windows(self, x, ws):
+        """分割窗口"""
+        B, C, H, W = x.shape
+        # ✅ 确保能整除
+        assert H % ws == 0 and W % ws == 0, f"H={H}, W={W} must be divisible by ws={ws}"
+        x = x.view(B, C, H//ws, ws, W//ws, ws)
+        x = x.permute(0, 2, 4, 3, 5, 1).contiguous()
+        x = x.view(-1, ws*ws, C)
+        return x
+    
+    def reverse_windows(self, x, ws, H, W, B):
+        """恢复窗口"""
+        x = x.view(B, H//ws, W//ws, ws, ws, -1)
+        x = x.permute(0, 5, 1, 3, 2, 4).contiguous()
+        x = x.view(B, -1, H, W)
+        return x
+
+class ContentGuidedGate(nn. Module):
+    """内容引导门控 - 决定局部/全局注意力权重"""
+    def __init__(self, in_channels, content_channels, num_groups=32):
+        super().__init__()
+        
+        # 内容特征投影
+        self.content_proj = nn.Conv2d(content_channels, in_channels, 1)
+        
+        # 门控网络 (只需要hidden_states + content)
+        self.gate_net = nn.Sequential(
+            nn.GroupNorm(num_groups, in_channels * 2),  # 只拼接2个特征
+            nn.Conv2d(in_channels * 2, in_channels // 2, 3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(in_channels // 2, 1, 1),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, hidden_states, content_feature):
+        """
+        Args:
+            hidden_states: [B, C, H, W]
+            content_feature: [B, C_content, H, W]
+            stroke_mask: [B, 1, H, W] (可选)
+        Returns:
+            alpha: [B, 1, H, W] 融合权重
+                   alpha≈1: 使用局部注意力 (有笔画)
+                   alpha≈0: 使用全局注意力 (背景)
+        """
+        # 投影内容特征
+        content_proj = self.content_proj(content_feature)
+        
+        # 自动处理尺寸不匹配
+        if content_proj.shape[-2: ] != hidden_states.shape[-2:]:
+            content_proj = F.interpolate(
+                content_proj,
+                size=hidden_states.shape[-2:],
+                mode='bilinear',
+                align_corners=False
+            )
+        
+        # 拼接 (只需要2个特征)
+        concat = torch.cat([hidden_states, content_proj], dim=1)
+        
+        # 生成门控权重
+        alpha = self.gate_net(concat)
+        
+        return alpha

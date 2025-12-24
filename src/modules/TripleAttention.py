@@ -81,4 +81,4 @@ if __name__ == '__main__':
     input = torch.randn(1, 512, 7, 7)
     Model = TripletAttention()
     output = Model(input)
-    print(output.shape)
+    # print(output.shape)

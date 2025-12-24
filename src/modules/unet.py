@@ -54,6 +54,7 @@ class UNet(ModelMixin, ConfigMixin):
         content_encoder_downsample_size: int = 4,
         content_start_channel: int = 16,
         reduction: int = 32,
+        window_size: int = 4,
     ):
         super().__init__()
 
@@ -84,13 +85,18 @@ class UNet(ModelMixin, ConfigMixin):
             output_channel = block_out_channels[i]
             is_final_block = i == len(block_out_channels) - 1
 
-            if down_block_type == "MCADownBlock2D":
-                # Mac块使用连续的Mac计数器
-                mac_block_counter += 1
-                # 只有MAC块需要content_channel
-                content_channel = content_start_channel*(2**(mac_block_counter-1))
+            # if down_block_type == "MCADownBlock2D":
+            #     # Mac块使用连续的Mac计数器
+            #     mac_block_counter += 1
+            #     # 只有MAC块需要content_channel
+            #     content_channel = content_start_channel*(2**(mac_block_counter-1))
                 
-            else :
+            # else :
+            #     content_channel = 0
+
+            if i != 0: 
+                content_channel = content_start_channel * (2 ** (i-1))
+            else:
                 content_channel = 0
                 
 
@@ -111,6 +117,7 @@ class UNet(ModelMixin, ConfigMixin):
                 content_channel=content_channel,
                 reduction=reduction,
                 channel_attn=channel_attn,
+                window_size=window_size,
             )
             self.down_blocks.append(down_block)
 
@@ -134,13 +141,13 @@ class UNet(ModelMixin, ConfigMixin):
         self.num_upsamplers = 0
 
         # up
-        print("获取上采样块输出通道顺序", block_out_channels)
+        # print("获取上采样块输出通道顺序", block_out_channels)
         reversed_block_out_channels = list(reversed(block_out_channels))
-        print("获取下采样块输出通道顺序", reversed_block_out_channels)
+        # print("获取下采样块输出通道顺序", reversed_block_out_channels)
         output_channel = reversed_block_out_channels[0]
-        # RSI块的计数器
-        rsi_block_counter = 0  # RSI块的计数器
-
+        # # RSI块的计数器
+        # rsi_block_counter = 0  # RSI块的计数器
+        effective_upblock_index=0  # 有效的上采样块索引
         for i, up_block_type in enumerate(up_block_types):
             is_final_block = i == len(block_out_channels) - 1
 
@@ -161,22 +168,24 @@ class UNet(ModelMixin, ConfigMixin):
             
             
             # ✅ 根据块类型计算有效的索引和通道数
-            if up_block_type == "StyleRSIUpBlock2D":
-                # RSI块使用连续的RSI计数器
-                effective_upblock_index = rsi_block_counter + 1  # 从1开始
-                rsi_block_counter += 1
-                print(f"RSI Block {i}: effective_index={effective_upblock_index}, content_channel={content_channel}")
+            # if up_block_type == "StyleRSIUpBlock2D":
+            #     # RSI块使用连续的RSI计数器
+            #     effective_upblock_index = rsi_block_counter + 1  # 从1开始
+            #     rsi_block_counter += 1
+            #     print(f"RSI Block {i}: effective_index={effective_upblock_index}, content_channel={content_channel}")
                 
-            elif up_block_type == "ParallelUpBlock2D":
-                # 平行块不参与RSI索引计算
-                effective_upblock_index = None  # 平行块不需要upblock_index
-                print(f"Parallel Block {i}: no upblock_index needed")
+            # elif up_block_type == "ParallelUpBlock2D":
+            #     # 平行块不参与RSI索引计算
+            #     effective_upblock_index = None  # 平行块不需要upblock_index
+            #     print(f"Parallel Block {i}: no upblock_index needed")
                 
+            # else:
+            #     # 普通块使用原始索引
+            #     effective_upblock_index = i
+            if i != 0:
+                content_channel = content_start_channel * (2 ** (3-i))
             else:
-                # 普通块使用原始索引
-                effective_upblock_index = i
-                
-
+                content_channel = 0
             print("Load the up block ", up_block_type)
             up_block = get_up_block_with_parallel(
                 up_block_type,
@@ -191,10 +200,15 @@ class UNet(ModelMixin, ConfigMixin):
                 resnet_groups=norm_num_groups,
                 cross_attention_dim=cross_attention_dim,
                 attn_num_head_channels=attention_head_dim,
-                upblock_index=effective_upblock_index,
-            )
+                upblock_index=i,
+                content_channel=content_channel,
+                window_size=window_size,)
             self.up_blocks.append(up_block)
             prev_output_channel = output_channel
+
+            # if up_block_type != "ParallelUpBlock2D":
+            #     # 更新有效上采样块索引
+            #     effective_upblock_index += 1  # 从1开始
 
         # out
         self.conv_norm_out = nn.GroupNorm(num_channels=block_out_channels[0], num_groups=norm_num_groups, eps=norm_eps)
@@ -273,20 +287,19 @@ class UNet(ModelMixin, ConfigMixin):
 
         # 3. down
         down_block_res_samples = (sample,)
-        efficient_index = 0
+        # efficient_index = 0
         for index,downsample_block in enumerate(self.down_blocks):
 
-            if hasattr(downsample_block, "content_attentions"):
-                # 指MCADownBlock层
-                efficient_index += 1
+            if hasattr(downsample_block, "content_attentions") | hasattr(downsample_block, "content_gates") :
+                # efficient_index += 1
                 sample, res_samples = downsample_block(
                     hidden_states=sample,
                     temb=emb,
                     encoder_hidden_states=encoder_hidden_states,
-                    index=efficient_index,
+                    index=index,
                 )
             else:
-                # 其余块
+                # 普通块
                 sample, res_samples = downsample_block(hidden_states=sample, temb=emb)   
 
             
@@ -326,6 +339,7 @@ class UNet(ModelMixin, ConfigMixin):
                     res_hidden_states_tuple=res_samples,
                     style_structure_features=encoder_hidden_states[3],
                     encoder_hidden_states=encoder_hidden_states[2],
+                    index=i,
                 )
                 offset_out_sum += offset_out
             else:
@@ -335,7 +349,9 @@ class UNet(ModelMixin, ConfigMixin):
                     sample = upsample_block(
                         hidden_states=sample, 
                         res_hidden_states_tuple=res_samples, 
-                        temb=emb
+                        temb=emb,
+                        index = i,
+                        encoder_hidden_states=encoder_hidden_states,
                     )
                 else:
                     # 普通上采样块

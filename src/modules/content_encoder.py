@@ -356,7 +356,8 @@ class ContentEncoder(ModelMixin, ConfigMixin):
                  G_kernel_size=3, G_attn='64_32_16_8', n_classes=1000, 
                  num_G_SVs=1, num_G_SV_itrs=1, G_activation=nn.ReLU(inplace=False), 
                  SN_eps=1e-12, output_dim=1,  G_fp16=False, 
-                 G_init='N02',  G_param='SN', nf_mlp = 512, nEmbedding = 256, input_nc = 3,output_nc = 3):
+                 G_init='N02',  G_param='SN', nf_mlp = 512, 
+                 nEmbedding = 256, input_nc = 3,output_nc = 3):
         super(ContentEncoder, self).__init__()
 
         self.ch = G_ch
@@ -400,7 +401,9 @@ class ContentEncoder(ModelMixin, ConfigMixin):
                                              wide=self.G_wide,
                                              activation=self.activation,
                                              preactivation=(index > 0),
-                                             downsample=nn.AvgPool2d(2))]]
+                                            #  downsample=nn.AvgPool2d(2)
+                                             downsample=nn.MaxPool2d(2)
+                                             )]]
 
         self.blocks = nn.ModuleList([nn.ModuleList(block) for block in self.blocks])
         self.init_weights()
@@ -427,9 +430,44 @@ class ContentEncoder(ModelMixin, ConfigMixin):
         h = x
         residual_features = []
         residual_features.append(h)
+        # print(f"Content original output shape: {h.shape}")  
         for index, blocklist in enumerate(self.blocks):
             for block in blocklist:
                 h = block(h)            
             if index in self.save_featrues[:-1]:
-                residual_features.append(h)        
+                residual_features.append(h)     
+            # print(f"Content Encoder Layer {index} output shape: {h.shape}")   
         return h,residual_features
+
+class AdaptiveDownsample(nn.Module):
+    """
+    自适应下采样:   结合MaxPool和AvgPool的优点
+    
+    思路:  
+    - 在有笔画的地方使用MaxPool (保护边缘)
+    - 在背景区域使用AvgPool (抑制噪声)
+    """
+    def __init__(self, threshold=0.3):
+        super().__init__()
+        self.max_pool = nn.MaxPool2d(2, 2)
+        self.avg_pool = nn.AvgPool2d(2, 2)
+        self.threshold = threshold
+    
+    def forward(self, x):
+        # 计算每个位置的激活强度
+        activation_strength = x.abs().mean(dim=1, keepdim=True)  # [B, 1, H, W]
+        
+        # 下采样activation_strength以匹配输出尺寸
+        strength_pooled = F.avg_pool2d(activation_strength, 2, 2)
+        
+        # 生成mask:   高激活区域用MaxPool，低激活区域用AvgPool
+        mask = (strength_pooled > self.threshold).float()  # [B, 1, H', W']
+        
+        # 分别计算
+        max_out = self.max_pool(x)
+        avg_out = self.avg_pool(x)
+        
+        # 混合
+        out = mask * max_out + (1 - mask) * avg_out
+        
+        return out

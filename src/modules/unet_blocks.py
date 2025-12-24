@@ -5,7 +5,9 @@ from torchvision.ops import DeformConv2d
 from .attention import (SpatialTransformer, 
                         OffsetRefStrucInter, 
                         ChannelAttnBlock,
-                        SelfAttentionBlock)
+                        SelfAttentionBlock,
+                        WindowAttentionBlock,
+                        ContentGuidedGate)
 from .resnet import (Downsample2D, 
                      ResnetBlock2D, 
                      Upsample2D)
@@ -76,7 +78,8 @@ def get_down_block_with_parallel(
     downsample_padding=None,
     channel_attn=False,
     content_channel=32,
-    reduction=32):
+    reduction=32,
+    window_size=4):
 
     down_block_type = down_block_type[7:] if down_block_type. startswith("UNetRes") else down_block_type
     if down_block_type == "DownBlock2D":
@@ -119,7 +122,9 @@ def get_down_block_with_parallel(
             resnet_act_fn=resnet_act_fn,
             resnet_groups=resnet_groups,
             downsample_padding=downsample_padding,
-            attn_num_head_channels=attn_num_head_channels)
+            attn_num_head_channels=attn_num_head_channels,
+            window_size=window_size,
+            content_channel=content_channel)
     else:
         raise ValueError(f"{down_block_type} does not exist.")
     
@@ -183,7 +188,9 @@ def get_up_block_with_parallel(
     upblock_index,
     resnet_groups=None,
     cross_attention_dim=None,
-    structure_feature_begin=64):
+    structure_feature_begin=64,
+    content_channel=32,
+    window_size=4):
 
     up_block_type = up_block_type[7:] if up_block_type.startswith("UNetRes") else up_block_type
     if up_block_type == "UpBlock2D":
@@ -223,7 +230,9 @@ def get_up_block_with_parallel(
             resnet_eps=resnet_eps,
             resnet_act_fn=resnet_act_fn,
             resnet_groups=resnet_groups,
-            attn_num_head_channels=attn_num_head_channels)
+            attn_num_head_channels=attn_num_head_channels,
+            window_size=4,
+            content_channel=content_channel)
     else:
         raise ValueError(f"{up_block_type} does not exist.")
 
@@ -579,7 +588,8 @@ class StyleRSIUpBlock2D(nn.Module):
             sc_interpreter_offsets.append(
                 OffsetRefStrucInter(
                     res_in_channels=res_skip_channels,
-                    style_feat_in_channels=int(structure_feature_begin * 2 / upblock_index),
+                    # style_feat_in_channels=int(structure_feature_begin * 2 / upblock_index),
+                    style_feat_in_channels=int(structure_feature_begin * (2 ** ( 3-self.upblock_index) )),
                     n_heads=attn_num_head_channels,
                     num_groups=resnet_groups,
                 )
@@ -655,20 +665,36 @@ class StyleRSIUpBlock2D(nn.Module):
         hidden_states,
         res_hidden_states_tuple,
         style_structure_features,
+        index,
         temb=None,
         encoder_hidden_states=None,
         upsample_size=None,
+        
     ):
         total_offset = 0
 
-        style_content_feat = style_structure_features[-self.upblock_index-2]
+        # style_content_feat = style_structure_features[-self.upblock_index-2]
+
+        #TODO 临时修改，不精确
+        style_content_feat = style_structure_features[-index-2]
+        # print(f"style_content_feat: {style_content_feat.shape}")
+
+        # ✅ 在循环外统一插值
+        if style_content_feat.shape[2:] != res_hidden_states_tuple[-1].shape[2:]:
+            import torch.nn.functional as F
+            style_content_feat = F. interpolate(
+                style_content_feat,
+                size=res_hidden_states_tuple[-1].shape[2:],
+                mode='bilinear',
+                align_corners=False
+            )
 
         for i, (sc_inter_offset, dcn_deform, resnet, attn) in \
             enumerate(zip(self.sc_interpreter_offsets, self.dcn_deforms, self.resnets, self.attentions)):
             # pop res hidden states 
             res_hidden_states = res_hidden_states_tuple[-1]
             res_hidden_states_tuple = res_hidden_states_tuple[:-1]
-            
+
             # Skip Style Content Interpreter by DCN
             offset = sc_inter_offset(res_hidden_states, style_content_feat)
             offset = offset.contiguous()
@@ -802,6 +828,8 @@ class ParallelDownBlock2D(nn.Module):
         output_scale_factor: float = 1.0,
         downsample_padding: int = 1,
         add_downsample: bool = False,  # 平行层默认不下采样
+        window_size: int = 4,  # ← 新增:  窗口注意力尺寸
+        content_channel: int = 0,  # ← 新增:  内容通道数
     ):
         super().__init__()
         
@@ -812,7 +840,9 @@ class ParallelDownBlock2D(nn.Module):
         self. attn_num_head_channels = attn_num_head_channels
         
         resnets = []
-        self_attentions = []
+        local_attentions = []   # ← 新增: 窗口注意力
+        global_attentions = []  # ← 保留:  全局注意力
+        content_gates = []      # ← 新增: 内容引导门控
 
         for i in range(num_layers):
             # ResNet块：特征精炼
@@ -831,22 +861,51 @@ class ParallelDownBlock2D(nn.Module):
                 )
             )
             
-            # 自注意力：增强特征内部关联
-            print(f"Creating self-attention for ParallelDownBlock2D layer {i+1}")
-            self_attentions. append(
+            # ← 新增: 局部窗口注意力 (保护细小笔画)
+            local_attentions.append(
+                WindowAttentionBlock(
+                    channels=in_channels,
+                    window_size=window_size,
+                    num_heads=4,
+                    num_groups=resnet_groups
+                )
+            )
+            
+            #全局自注意力 (保持原有)
+            global_attentions. append(
                 SelfAttentionBlock(
-                    in_channels=in_channels,  # 修正：使用in_channels
+                    in_channels=in_channels,
                     n_heads=attn_num_head_channels,
-                    d_head=in_channels // attn_num_head_channels,  # 修正：计算d_head
+                    d_head=in_channels // attn_num_head_channels,
                     dropout=dropout,
                     num_groups=resnet_groups,
                 )
             )
+            # global_attentions.append(
+            #     WindowAttentionBlock(
+            #         channels=in_channels,
+            #         window_size=window_size*2,  # 扩大窗口覆盖全局
+            #         num_heads=2,
+            #         num_groups=resnet_groups
+            #     )
+            # )
+            
+            # ← 新增: 内容引导门控
+            if content_channel > 0:
+                content_gates.append(
+                    ContentGuidedGate(
+                        in_channels=in_channels,
+                        content_channels=content_channel,
+                        num_groups=resnet_groups
+                    )
+                )
+            else:
+                content_gates.append(None)
         
-        self. resnets = nn.ModuleList(resnets)
-        self.self_attentions = nn.ModuleList(self_attentions)
-        
-
+        self.resnets = nn.ModuleList(resnets)
+        self.local_attentions = nn.ModuleList(local_attentions)
+        self.global_attentions = nn.ModuleList(global_attentions)
+        self.content_gates = nn.ModuleList(content_gates)
         # 平行层通常不需要下采样，但保持接口一致性
         if add_downsample:
             print("Warning: ParallelDownBlock2D with add_downsample=True may break parallel processing")
@@ -861,15 +920,32 @@ class ParallelDownBlock2D(nn.Module):
         self.gradient_checkpointing = False
         print(f"Created ParallelDownBlock2D: {in_channels} channels, {num_layers} layers, downsample={add_downsample}")
 
-    def forward(self, hidden_states, temb=None, **kwargs):
+    def forward(self, hidden_states, index, temb=None, encoder_hidden_states=None,  **kwargs):
         output_states = ()
-
-        for resnet, self_attn in zip(self.resnets, self. self_attentions):
+        content_feature = encoder_hidden_states[1][index]
+        for resnet, local_attn, global_attn, gate in zip(self.resnets, self.local_attentions, self.global_attentions, self.content_gates):
             # 1. ResNet特征精炼
             hidden_states = resnet(hidden_states, temb)
             
-            # 2. 自注意力增强 - 移除多余的残差连接
-            hidden_states = self_attn(hidden_states)  # SelfAttentionBlock内部已有残差连接
+            # Step 2: 双路注意力
+            # 2a.  局部窗口注意力 (保护细节)
+            h_local = local_attn(hidden_states)
+            
+            # 2b. 全局自注意力 (保持连贯)
+            h_global = global_attn(hidden_states)
+
+            # Step 3: 内容引导融合
+            if gate is not None and content_feature is not None: 
+                # 生成融合权重
+                alpha = gate(hidden_states, content_feature)
+                
+                # 自适应融合: 
+                # - 在笔画区域: 优先使用局部注意力 (保护细节)
+                # - 在背景区域: 使用全局注意力 (保持流畅)
+                hidden_states = alpha * h_local + (1 - alpha) * h_global
+            else:
+                # 无内容引导时简单平均
+                hidden_states = 0.5 * h_local + 0.5 * h_global
 
             output_states += (hidden_states,)
 
@@ -900,6 +976,8 @@ class ParallelUpBlock2D(nn.Module):
         attention_type: str = "default",
         output_scale_factor: float = 1.0,
         add_upsample: bool = False,
+        content_channel: int = 0, # ← 新增
+        window_size: int = 4,  # ← 新增:  窗口注意力尺寸
     ):
         super().__init__()
         
@@ -909,7 +987,9 @@ class ParallelUpBlock2D(nn.Module):
         self.parallel = True
 
         resnets = []
-        self_attentions = []
+        local_attentions = []   # ← 新增: 窗口注意力
+        global_attentions = []  # ← 保留:  全局注意力
+        content_gates = []      # ← 新增: 内容引导门控
 
         for i in range(num_layers):
             res_skip_channels = in_channels if (i == num_layers - 1) else out_channels
@@ -930,10 +1010,19 @@ class ParallelUpBlock2D(nn.Module):
                     pre_norm=resnet_pre_norm,
                 )
             )
+
+            # ← 新增: 局部窗口注意力 (保护细小笔画)
+            local_attentions.append(
+                WindowAttentionBlock(
+                    channels=in_channels,
+                    window_size=window_size,
+                    num_heads=4,
+                    num_groups=resnet_groups
+                )
+            )
             
             # 自注意力块 - 修正参数
-            print(f"Creating self-attention for ParallelUpBlock2D layer {i+1}")
-            self_attentions. append(
+            global_attentions. append(
                 SelfAttentionBlock(
                     in_channels=out_channels,  # 修正：使用out_channels
                     n_heads=attn_num_head_channels,
@@ -943,8 +1032,22 @@ class ParallelUpBlock2D(nn.Module):
                 )
             )
 
+            # ← 新增: 内容引导门控
+            if content_channel > 0:
+                content_gates.append(
+                    ContentGuidedGate(
+                        in_channels=in_channels,
+                        content_channels=content_channel,
+                        num_groups=resnet_groups
+                    )
+                )
+            else:
+                content_gates.append(None)
+
         self.resnets = nn.ModuleList(resnets)
-        self. self_attentions = nn.ModuleList(self_attentions)
+        self.local_attentions = nn.ModuleList(local_attentions)
+        self.global_attentions = nn.ModuleList(global_attentions)
+        self.content_gates = nn.ModuleList(content_gates)
 
 
         #上采样层
@@ -959,11 +1062,13 @@ class ParallelUpBlock2D(nn.Module):
         self.gradient_checkpointing = False
         print(f"Created ParallelUpBlock2D: {prev_output_channel}+{in_channels}->{out_channels}, {num_layers} layers, upsample={add_upsample}")
 
-    def forward(self, hidden_states, res_hidden_states_tuple, temb=None, upsample_size=None, **kwargs):
-        for resnet, self_attn in zip(self.resnets, self.self_attentions):
+    def forward(self, hidden_states, index,res_hidden_states_tuple, temb=None, upsample_size=None, encoder_hidden_states=None,  **kwargs):
+        for resnet, local_attn, global_attn, gate in zip(self.resnets, self.local_attentions, self.global_attentions, self.content_gates):
             # 处理跳跃连接
             res_hidden_states = res_hidden_states_tuple[-1]
             res_hidden_states_tuple = res_hidden_states_tuple[:-1]
+
+            content_feature = encoder_hidden_states[3][index]
 
             # ✅ 处理跳跃连接尺寸不匹配（这是正常的！）
             if hidden_states. shape[2:] != res_hidden_states.shape[2:]:
@@ -988,16 +1093,41 @@ class ParallelUpBlock2D(nn.Module):
                 hidden_states = torch.utils.checkpoint. checkpoint(
                     create_custom_forward(resnet), hidden_states, temb
                 )
-                # 自注意力处理
-                hidden_states = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(self_attn), hidden_states
+                # 局部窗口注意力处理
+                h_local = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(local_attn), hidden_states
                 )
+                # 自注意力处理
+                h_global = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(global_attn), hidden_states
+                )
+
+                #  内容引导融合
+                if gate is not None and content_feature is not None: 
+                    # 生成融合权重
+                    alpha =  torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(gate), hidden_states, content_feature)
+                    
+                    # 自适应融合: 
+                    # - 在笔画区域: 优先使用局部注意力 (保护细节)
+                    # - 在背景区域: 使用全局注意力 (保持流畅)
+                    hidden_states = alpha * h_local + (1 - alpha) * h_global
+                else:
+                    # 无内容引导时简单平均
+                    hidden_states = 0.5 * h_local + 0.5 * h_global
             else:
                 # 1. ResNet处理跳跃连接和特征精炼
                 hidden_states = resnet(hidden_states, temb)
                 
-                # 2. 自注意力增强
-                hidden_states = self_attn(hidden_states)  # 移除多余的残差连接
+                # 局部窗口注意力处理
+                h_local = local_attn(hidden_states)
+                # 自注意力处理
+                h_global = global_attn(hidden_states)
+                if gate is not None and content_feature is not None: 
+                    alpha = gate(hidden_states, content_feature)
+                    hidden_states = alpha * h_local + (1 - alpha) * h_global
+                else:
+                    hidden_states = 0.5 * h_local + 0.5 * h_global
 
         # 上采样
         if self.upsamplers is not None:

@@ -61,7 +61,7 @@ def build_unet_with_parallel_layers(args):
                         'UpBlock2D'),              # Layer 4: 32×32 → 64×64
         
         # 通道配置：平行层保持通道数不变
-        block_out_channels=args.unet_channels ,  # Layer 2保持128
+        block_out_channels=args.unet_channels ,  # (64, 128, 128, 256, 512)
         
         # # 平行层配置
         # parallel_layer_indices=[2],  # 第2层是平行处理层
@@ -77,7 +77,8 @@ def build_unet_with_parallel_layers(args):
         channel_attn=args.channel_attn,
         content_encoder_downsample_size=args.content_encoder_downsample_size,
         content_start_channel=args.content_start_channel,
-        reduction=32)
+        reduction=32,
+        window_size=4)
     
     print("Built UNet with parallel processing layers!")
     

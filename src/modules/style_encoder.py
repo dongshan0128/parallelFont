@@ -396,7 +396,8 @@ class StyleEncoder(ModelMixin, ConfigMixin):
           nn.ModuleList(block) for block in self.blocks
         ])
         last_layer = nn.Sequential(
-          nn.InstanceNorm2d(self.arch['out_channels'][-1]),
+            # 移除 InstanceNorm，保留全局方差和均值
+            # nn.InstanceNorm2d(self.arch['out_channels'][-1]),
           self.activation,
           nn.Conv2d(
             self.arch['out_channels'][-1],
@@ -407,6 +408,21 @@ class StyleEncoder(ModelMixin, ConfigMixin):
         )
         self.blocks.append(last_layer)
         self.init_weights()
+
+        # 添加多尺度风格池化
+        self.style_pools = nn.ModuleList([
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.AdaptiveAvgPool2d((2, 2)),
+            nn.AdaptiveAvgPool2d((4, 4))
+        ])
+        
+        # 风格融合层
+        self.style_fusion = nn.Conv2d(
+            self.arch['out_channels'][-1] * 3,
+            self.arch['out_channels'][-1],
+            kernel_size=1
+        )
+        
 
     def init_weights(self):
         self.param_count = 0
@@ -433,8 +449,27 @@ class StyleEncoder(ModelMixin, ConfigMixin):
             for block in blocklist:
                 h = block(h)            
             if index in self.save_featrues[:-1]:
-                residual_features.append(h)        
+                residual_features.append(h)
+                # print(f"Style Encoder Layer {index} output shape: {h.shape}")        
         h = self.blocks[-1](h)
+
+        # 多尺度风格提取
+        multi_scale_styles = []
+        for pool in self.style_pools:
+            pooled = pool(h)
+            # 上采样回原始尺寸
+            upsampled = F.interpolate(
+                pooled, 
+                size=h.shape[2:], 
+                mode='nearest'
+            )
+            multi_scale_styles.append(upsampled)
+        
+        # 融合多尺度风格
+        style_emd = self.style_fusion(
+            torch.cat(multi_scale_styles, dim=1)
+        )
+
         style_emd = h        
         h = F.adaptive_avg_pool2d(h,(1,1))
         h = h.view(h.size(0),-1)
