@@ -1,8 +1,10 @@
 python infer_phase1.py \
-  --ckpt_dir "outputs/FontDiffuser/global_step_240000" \
-  --content "data_examples/train/ContentImage/俺.jpg" \
-  --style "data_examples/train/TargetImage/FZBaiZYHTJW/卑.jpg" \
-  --output "outputs/FontDiffuser/phase1.png" \
-  --steps 20 \
-  --seed 123 \
-  --device cuda:0
+  --ckpt_dir "outputs/the_forth_try/global_step_280000" \
+  --config_path "outputs/the_forth_try/FontDiffuser_training_phase_1_config.yaml" \
+  --content_image_path "data_examples/sampling/1166.png" \
+  --style_image_path "data_examples/sampling/1_4_3_年_异体字.png" \
+  --save_image \
+  --save_image_dir "outputs/phase1_inference" \
+  --sampler "dpm-solver++" \
+  --device cuda:0 \
+  --num_inference_steps 20 \
