@@ -2,12 +2,12 @@ accelerate launch train.py \
     --seed=123 \
     --experience_name="FontDiffuser_training_phase_1" \
     --data_root="data_examples" \
-    --output_dir="outputs/the_forth_try" \
+    --output_dir="outputs/FontDiffuser_431Fonts" \
     --report_to="tensorboard" \
-    --resolution=128 \
-    --style_image_size=128 \
-    --content_image_size=128 \
-    --content_encoder_downsample_size=4 \
+    --resolution=96 \
+    --style_image_size=96 \
+    --content_image_size=96 \
+    --content_encoder_downsample_size=3 \
     --channel_attn=True \
     --content_start_channel=64 \
     --style_start_channel=64 \
