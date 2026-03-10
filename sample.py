@@ -94,6 +94,7 @@ def image_process(args, content_image=None, style_image=None):
 
 def load_fontdiffuer_pipeline(args):
     # Load the model state_dict
+    # unet = build_unet(args=args)
     unet = build_unet_with_parallel_layers(args=args)
     unet.load_state_dict(torch.load(f"{args.ckpt_dir}/unet.pth"))
     style_encoder = build_style_encoder(args=args)
